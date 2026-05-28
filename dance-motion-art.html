@@ -1,0 +1,1251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dance Motion Art - 舞蹈轨迹艺术生成器</title>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.0/dist/pose-detection.min.js"></script>
+
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <style>
+        body { background: #0a0a0a; color: #e0e0e0; }
+        .canvas-container { position: relative; width: 100%; height: 600px; }
+        #canvas2D, #canvas3D { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        #canvas3D { display: none; }
+        .control-panel { background: #1a1a1a; border: 1px solid #333; }
+        input[type="range"] { accent-color: #00d4ff; }
+        .progress-bar { transition: width 0.3s ease; }
+        .glow-text { text-shadow: 0 0 10px rgba(0, 212, 255, 0.5); }
+
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #0a0a0a; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+    </style>
+</head>
+<body class="min-h-screen font-sans">
+
+    <!-- 头部 -->
+    <header class="border-b border-gray-800 py-6 px-8">
+        <div class="max-w-7xl mx-auto flex items-center justify-between">
+            <div>
+                <h1 class="text-3xl font-bold glow-text text-cyan-400">Dance Motion Art</h1>
+                <p class="text-gray-500 mt-1">上传舞蹈视频，生成真实的运动轨迹艺术</p>
+            </div>
+            <div class="flex gap-4">
+                <a href="https://github.com/YOUR_USERNAME/dance-motion-art" target="_blank" 
+                   class="px-4 py-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition flex items-center gap-2">
+                    <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+                    GitHub
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto p-8">
+
+        <!-- 上传区域 -->
+        <section id="uploadSection" class="mb-8">
+            <div class="border-2 border-dashed border-gray-700 rounded-2xl p-12 text-center hover:border-cyan-500 transition cursor-pointer"
+                 onclick="document.getElementById('videoInput').click()">
+                <div class="w-20 h-20 mx-auto mb-4 rounded-full bg-gray-800 flex items-center justify-center">
+                    <svg class="w-10 h-10 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+                </div>
+                <p class="text-lg mb-2">点击上传舞蹈视频</p>
+                <p class="text-sm text-gray-500">支持 MP4, MOV, WebM | 建议 720p 以上，光线充足</p>
+                <input type="file" id="videoInput" accept="video/*" class="hidden" onchange="handleUpload(event)">
+            </div>
+        </section>
+
+        <!-- 处理进度 -->
+        <section id="progressSection" class="mb-8 hidden">
+            <div class="control-panel rounded-xl p-6">
+                <div class="flex justify-between mb-2">
+                    <span id="progressText" class="text-cyan-400">正在分析动作...</span>
+                    <span id="progressPercent" class="text-gray-400">0%</span>
+                </div>
+                <div class="w-full bg-gray-800 rounded-full h-3">
+                    <div id="progressBar" class="progress-bar bg-gradient-to-r from-cyan-500 to-blue-500 h-3 rounded-full" style="width: 0%"></div>
+                </div>
+                <p class="text-sm text-gray-500 mt-2">所有处理在浏览器本地完成，视频不会上传到服务器</p>
+            </div>
+        </section>
+
+        <!-- 主工作区 -->
+        <section id="workspace" class="hidden">
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+                <!-- 左侧：控制面板 -->
+                <div class="lg:col-span-1 space-y-4">
+
+                    <!-- 模式切换 -->
+                    <div class="control-panel rounded-xl p-5">
+                        <h3 class="font-semibold mb-3 text-cyan-400">渲染模式</h3>
+                        <div class="flex gap-2">
+                            <button onclick="setMode('2D')" id="btn2D" class="flex-1 py-2 px-4 bg-cyan-600 rounded-lg text-sm font-medium transition">2D 线条艺术</button>
+                            <button onclick="setMode('3D')" id="btn3D" class="flex-1 py-2 px-4 bg-gray-700 rounded-lg text-sm font-medium transition hover:bg-gray-600">3D 空间雕塑</button>
+                        </div>
+                    </div>
+
+                    <!-- 2D 参数 -->
+                    <div id="controls2D" class="control-panel rounded-xl p-5 space-y-4">
+                        <h3 class="font-semibold text-cyan-400">线条艺术参数</h3>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>轨迹长度</span>
+                                <span id="trailLengthVal">60帧</span>
+                            </label>
+                            <input type="range" id="trailLength" min="10" max="300" value="60" 
+                                   class="w-full mt-1" oninput="updateParam('trailLength', this.value)">
+                        </div>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>线条粗细</span>
+                                <span id="lineWidthVal">速度映射</span>
+                            </label>
+                            <select id="lineWidthMode" class="w-full mt-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm"
+                                    onchange="updateParam('lineWidthMode', this.value)">
+                                <option value="speed">速度映射</option>
+                                <option value="fixed">固定粗细</option>
+                                <option value="time">时间渐变</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>颜色映射</span>
+                                <span id="colorMapVal">速度</span>
+                            </label>
+                            <select id="colorMap" class="w-full mt-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm"
+                                    onchange="updateParam('colorMap', this.value)">
+                                <option value="speed">运动速度</option>
+                                <option value="joint">关节类型</option>
+                                <option value="height">空间高度</option>
+                                <option value="time">时间流逝</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>背景模式</span>
+                                <span id="bgModeVal">残影拖尾</span>
+                            </label>
+                            <select id="bgMode" class="w-full mt-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm"
+                                    onchange="updateParam('bgMode', this.value)">
+                                <option value="trail">残影拖尾</option>
+                                <option value="black">纯黑背景</option>
+                                <option value="video">视频叠加</option>
+                                <option value="white">纯白背景</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>几何连接</span>
+                                <span id="connectionVal">仅关节轨迹</span>
+                            </label>
+                            <select id="connectionMode" class="w-full mt-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm"
+                                    onchange="updateParam('connectionMode', this.value)">
+                                <option value="none">仅关节轨迹</option>
+                                <option value="adjacent">相邻关节连线</option>
+                                <option value="symmetry">对称关节连线</option>
+                                <option value="voronoi">Voronoi图案</option>
+                            </select>
+                        </div>
+
+                        <div class="flex items-center gap-2">
+                            <input type="checkbox" id="showSkeleton" class="w-4 h-4 accent-cyan-500" checked 
+                                   onchange="updateParam('showSkeleton', this.checked)">
+                            <label for="showSkeleton" class="text-sm">显示骨骼连线</label>
+                        </div>
+
+                        <div class="flex items-center gap-2">
+                            <input type="checkbox" id="glowEffect" class="w-4 h-4 accent-cyan-500" checked 
+                                   onchange="updateParam('glowEffect', this.checked)">
+                            <label for="glowEffect" class="text-sm">发光效果</label>
+                        </div>
+                    </div>
+
+                    <!-- 3D 参数 -->
+                    <div id="controls3D" class="control-panel rounded-xl p-5 space-y-4 hidden">
+                        <h3 class="font-semibold text-cyan-400">3D雕塑参数</h3>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>管径粗细</span>
+                                <span id="tubeRadiusVal">0.05</span>
+                            </label>
+                            <input type="range" id="tubeRadius" min="0.01" max="0.2" step="0.01" value="0.05" 
+                                   class="w-full mt-1" oninput="updateParam('tubeRadius', this.value)">
+                        </div>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>时间轴深度</span>
+                                <span id="timeDepthVal">0.05</span>
+                            </label>
+                            <input type="range" id="timeDepth" min="0" max="0.2" step="0.01" value="0.05" 
+                                   class="w-full mt-1" oninput="updateParam('timeDepth', this.value)">
+                        </div>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>材质类型</span>
+                                <span id="materialVal">发光</span>
+                            </label>
+                            <select id="materialType" class="w-full mt-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm"
+                                    onchange="updateParam('materialType', this.value)">
+                                <option value="emissive">发光材质</option>
+                                <option value="standard">标准材质</option>
+                                <option value="wireframe">线框</option>
+                                <option value="glass">玻璃质感</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="text-sm text-gray-400 flex justify-between">
+                                <span>灯光强度</span>
+                                <span id="lightIntensityVal">1.0</span>
+                            </label>
+                            <input type="range" id="lightIntensity" min="0" max="3" step="0.1" value="1" 
+                                   class="w-full mt-1" oninput="updateParam('lightIntensity', this.value)">
+                        </div>
+
+                        <div class="flex items-center gap-2">
+                            <input type="checkbox" id="autoRotate" class="w-4 h-4 accent-cyan-500" checked 
+                                   onchange="updateParam('autoRotate', this.checked)">
+                            <label for="autoRotate" class="text-sm">自动旋转</label>
+                        </div>
+
+                        <div class="flex items-center gap-2">
+                            <input type="checkbox" id="bloomEffect" class="w-4 h-4 accent-cyan-500" checked 
+                                   onchange="updateParam('bloomEffect', this.checked)">
+                            <label for="bloomEffect" class="text-sm">泛光效果</label>
+                        </div>
+                    </div>
+
+                    <!-- 导出按钮 -->
+                    <div class="control-panel rounded-xl p-5 space-y-3">
+                        <h3 class="font-semibold text-cyan-400">导出作品</h3>
+                        <button onclick="exportMP4()" class="w-full py-2 px-4 bg-gradient-to-r from-cyan-600 to-blue-600 rounded-lg hover:from-cyan-500 hover:to-blue-500 transition font-medium">
+                            📹 导出 MP4 视频
+                        </button>
+                        <button onclick="exportSVG()" class="w-full py-2 px-4 bg-gray-700 rounded-lg hover:bg-gray-600 transition font-medium">
+                            🎨 导出 SVG 矢量图
+                        </button>
+                        <button onclick="exportGLB()" class="w-full py-2 px-4 bg-gray-700 rounded-lg hover:bg-gray-600 transition font-medium">
+                            🧊 导出 GLB 3D模型
+                        </button>
+                        <button onclick="exportPNG()" class="w-full py-2 px-4 bg-gray-700 rounded-lg hover:bg-gray-600 transition font-medium">
+                            🖼️ 导出 PNG 图片
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 右侧：画布区域 -->
+                <div class="lg:col-span-2">
+                    <div class="canvas-container control-panel rounded-xl overflow-hidden">
+                        <canvas id="canvas2D"></canvas>
+                        <div id="canvas3D" class="w-full h-full"></div>
+
+                        <!-- 视频预览（隐藏） -->
+                        <video id="sourceVideo" class="hidden" playsinline></video>
+
+                        <!-- 播放控制 -->
+                        <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-4">
+                            <div class="flex items-center gap-4">
+                                <button onclick="togglePlay()" id="playBtn" class="w-10 h-10 rounded-full bg-cyan-500 flex items-center justify-center hover:bg-cyan-400 transition">
+                                    <svg class="w-5 h-5 text-black" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                </button>
+                                <input type="range" id="timeSlider" min="0" max="100" value="0" 
+                                       class="flex-1 accent-cyan-500" oninput="seekTime(this.value)">
+                                <span id="timeDisplay" class="text-sm font-mono text-gray-400">00:00 / 00:00</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 帧率/状态信息 -->
+                    <div class="mt-2 flex justify-between text-xs text-gray-500 font-mono">
+                        <span id="fpsDisplay">FPS: --</span>
+                        <span id="poseDisplay">关键点: --</span>
+                        <span id="frameDisplay">帧: -- / --</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- 隐藏的离屏画布（用于视频处理） -->
+    <canvas id="offscreenCanvas" class="hidden"></canvas>
+
+<script>
+// ============================================
+// 姿态检测模块 - PoseDetector
+// ============================================
+class PoseDetector {
+    constructor() {
+        this.detector = null;
+        this.modelLoaded = false;
+        this.keypointNames = [
+            'nose', 'leftEye', 'rightEye', 'leftEar', 'rightEar',
+            'leftShoulder', 'rightShoulder', 'leftElbow', 'rightElbow',
+            'leftWrist', 'rightWrist', 'leftHip', 'rightHip',
+            'leftKnee', 'rightKnee', 'leftAnkle', 'rightAnkle'
+        ];
+    }
+
+    async loadModel() {
+        if (this.modelLoaded) return;
+
+        console.log('正在加载 MoveNet 模型...');
+        updateProgressText('正在加载 AI 模型...');
+
+        await tf.setBackend('webgl');
+
+        this.detector = await poseDetection.createDetector(
+            poseDetection.SupportedModels.MoveNet,
+            {
+                modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+                enableSmoothing: true
+            }
+        );
+
+        this.modelLoaded = true;
+        console.log('模型加载完成');
+    }
+
+    async processVideo(videoElement, onFrameProgress) {
+        await this.loadModel();
+
+        const canvas = document.getElementById('offscreenCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const scale = 0.5;
+        canvas.width = videoElement.videoWidth * scale;
+        canvas.height = videoElement.videoHeight * scale;
+
+        const fps = 30;
+        const totalFrames = Math.floor(videoElement.duration * fps);
+        const poses = [];
+        const trails = {};
+
+        this.keypointNames.forEach(name => {
+            trails[name] = [];
+        });
+
+        updateProgressText('正在分析舞蹈动作...');
+
+        for (let i = 0; i < totalFrames; i++) {
+            const time = i / fps;
+            videoElement.currentTime = time;
+
+            await new Promise(resolve => {
+                const onSeeked = () => {
+                    videoElement.removeEventListener('seeked', onSeeked);
+                    resolve();
+                };
+                videoElement.addEventListener('seeked', onSeeked);
+            });
+
+            ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+            const pose = await this.detector.estimatePoses(imageData);
+
+            if (pose.length > 0) {
+                const keypoints = pose[0].keypoints;
+                const frameData = {
+                    frame: i,
+                    time: time,
+                    keypoints: {}
+                };
+
+                keypoints.forEach((kp, idx) => {
+                    const name = this.keypointNames[idx];
+                    const normalizedX = kp.x / canvas.width;
+                    const normalizedY = kp.y / canvas.height;
+
+                    frameData.keypoints[name] = {
+                        x: normalizedX,
+                        y: normalizedY,
+                        score: kp.score,
+                        rawX: kp.x,
+                        rawY: kp.y
+                    };
+
+                    if (trails[name].length > 0) {
+                        const last = trails[name][trails[name].length - 1];
+                        const dx = normalizedX - last.x;
+                        const dy = normalizedY - last.y;
+                        frameData.keypoints[name].speed = Math.sqrt(dx*dx + dy*dy);
+                    } else {
+                        frameData.keypoints[name].speed = 0;
+                    }
+
+                    trails[name].push({
+                        x: normalizedX,
+                        y: normalizedY,
+                        frame: i,
+                        speed: frameData.keypoints[name].speed,
+                        score: kp.score
+                    });
+
+                    const maxTrailLength = 300;
+                    if (trails[name].length > maxTrailLength) {
+                        trails[name].shift();
+                    }
+                });
+
+                poses.push(frameData);
+            }
+
+            const progress = Math.round((i / totalFrames) * 100);
+            updateProgress(progress);
+            if (onFrameProgress) onFrameProgress(progress);
+        }
+
+        return { poses, trails, videoInfo: {
+            width: videoElement.videoWidth,
+            height: videoElement.videoHeight,
+            duration: videoElement.duration,
+            fps: fps,
+            totalFrames: totalFrames
+        }};
+    }
+}
+
+// ============================================
+// 2D 渲染器 - Renderer2D
+// ============================================
+class Renderer2D {
+    constructor() {
+        this.canvas = document.getElementById('canvas2D');
+        this.ctx = this.canvas.getContext('2d');
+        this.params = {
+            trailLength: 60,
+            lineWidthMode: 'speed',
+            colorMap: 'speed',
+            bgMode: 'trail',
+            connectionMode: 'none',
+            showSkeleton: true,
+            glowEffect: true
+        };
+        this.trails = {};
+        this.jointColors = {
+            nose: '#ffffff',
+            leftEye: '#00ffff', rightEye: '#00ffff',
+            leftEar: '#0088ff', rightEar: '#0088ff',
+            leftShoulder: '#ff0066', rightShoulder: '#ff0066',
+            leftElbow: '#ff4488', rightElbow: '#ff4488',
+            leftWrist: '#ff88aa', rightWrist: '#ff88aa',
+            leftHip: '#6600ff', rightHip: '#6600ff',
+            leftKnee: '#8844ff', rightKnee: '#8844ff',
+            leftAnkle: '#aa88ff', rightAnkle: '#aa88ff'
+        };
+    }
+
+    resize(width, height) {
+        this.canvas.width = width;
+        this.canvas.height = height;
+    }
+
+    updateParams(newParams) {
+        Object.assign(this.params, newParams);
+    }
+
+    setTrails(trails) {
+        this.trails = trails;
+    }
+
+    getColor(jointName, point, trail, frameIndex) {
+        const { colorMap } = this.params;
+
+        switch(colorMap) {
+            case 'speed': {
+                const speed = point.speed || 0;
+                const hue = 240 - Math.min(speed * 2000, 240);
+                return `hsla(${hue}, 80%, 60%, ${point.alpha || 1})`;
+            }
+            case 'joint': {
+                return this.jointColors[jointName] || '#ffffff';
+            }
+            case 'height': {
+                const hue = 240 - (point.y * 240);
+                return `hsla(${hue}, 80%, 60%, ${point.alpha || 1})`;
+            }
+            case 'time': {
+                const hue = (frameIndex * 2) % 360;
+                return `hsla(${hue}, 80%, 60%, ${point.alpha || 1})`;
+            }
+            default:
+                return '#ffffff';
+        }
+    }
+
+    getLineWidth(point, frameIndex, totalFrames) {
+        const { lineWidthMode } = this.params;
+
+        switch(lineWidthMode) {
+            case 'speed': {
+                const speed = point.speed || 0;
+                return Math.max(0.5, 8 - speed * 1000);
+            }
+            case 'fixed':
+                return 2;
+            case 'time': {
+                const progress = frameIndex / totalFrames;
+                return 1 + Math.sin(progress * Math.PI) * 4;
+            }
+            default:
+                return 2;
+        }
+    }
+
+    render(frameData, allPoses, frameIndex) {
+        const { width, height } = this.canvas;
+        const { bgMode, showSkeleton, glowEffect, connectionMode } = this.params;
+
+        switch(bgMode) {
+            case 'trail':
+                this.ctx.fillStyle = 'rgba(10, 10, 10, 0.08)';
+                this.ctx.fillRect(0, 0, width, height);
+                break;
+            case 'black':
+                this.ctx.fillStyle = '#0a0a0a';
+                this.ctx.fillRect(0, 0, width, height);
+                break;
+            case 'white':
+                this.ctx.fillStyle = '#ffffff';
+                this.ctx.fillRect(0, 0, width, height);
+                break;
+            case 'video':
+                break;
+        }
+
+        if (glowEffect) {
+            this.ctx.shadowBlur = 15;
+            this.ctx.shadowColor = 'rgba(0, 212, 255, 0.3)';
+        } else {
+            this.ctx.shadowBlur = 0;
+        }
+
+        for (const [jointName, trail] of Object.entries(this.trails)) {
+            if (trail.length < 2) continue;
+
+            const visibleTrail = trail.slice(-this.params.trailLength);
+
+            for (let i = 1; i < visibleTrail.length; i++) {
+                const prev = visibleTrail[i - 1];
+                const curr = visibleTrail[i];
+
+                const x1 = prev.x * width;
+                const y1 = prev.y * height;
+                const x2 = curr.x * width;
+                const y2 = curr.y * height;
+
+                const alpha = i / visibleTrail.length;
+                curr.alpha = alpha;
+
+                this.ctx.strokeStyle = this.getColor(jointName, curr, trail, frameIndex);
+                this.ctx.lineWidth = this.getLineWidth(curr, frameIndex, allPoses.length) * alpha;
+                this.ctx.lineCap = 'round';
+                this.ctx.lineJoin = 'round';
+
+                this.ctx.beginPath();
+                this.ctx.moveTo(x1, y1);
+
+                if (i < visibleTrail.length - 1) {
+                    const next = visibleTrail[i + 1];
+                    const cpx = (x1 + x2) / 2;
+                    const cpy = (y1 + y2) / 2;
+                    this.ctx.quadraticCurveTo(x1, y1, cpx, cpy);
+                } else {
+                    this.ctx.lineTo(x2, y2);
+                }
+
+                this.ctx.stroke();
+            }
+        }
+
+        if (connectionMode !== 'none' && frameData) {
+            this.drawConnections(frameData, width, height);
+        }
+
+        if (showSkeleton && frameData) {
+            this.drawSkeleton(frameData, width, height);
+        }
+
+        this.ctx.shadowBlur = 0;
+    }
+
+    drawConnections(frameData, width, height) {
+        const { connectionMode } = this.params;
+        const kp = frameData.keypoints;
+
+        this.ctx.globalAlpha = 0.3;
+        this.ctx.strokeStyle = '#00d4ff';
+        this.ctx.lineWidth = 0.5;
+
+        const connections = [];
+
+        if (connectionMode === 'adjacent') {
+            connections.push(
+                ['leftWrist', 'leftElbow'], ['leftElbow', 'leftShoulder'],
+                ['rightWrist', 'rightElbow'], ['rightElbow', 'rightShoulder'],
+                ['leftAnkle', 'leftKnee'], ['leftKnee', 'leftHip'],
+                ['rightAnkle', 'rightKnee'], ['rightKnee', 'rightHip']
+            );
+        } else if (connectionMode === 'symmetry') {
+            connections.push(
+                ['leftWrist', 'rightWrist'], ['leftAnkle', 'rightAnkle'],
+                ['leftShoulder', 'rightShoulder'], ['leftHip', 'rightHip']
+            );
+        }
+
+        for (const [a, b] of connections) {
+            if (kp[a] && kp[b] && kp[a].score > 0.3 && kp[b].score > 0.3) {
+                this.ctx.beginPath();
+                this.ctx.moveTo(kp[a].x * width, kp[a].y * height);
+                this.ctx.lineTo(kp[b].x * width, kp[b].y * height);
+                this.ctx.stroke();
+            }
+        }
+
+        this.ctx.globalAlpha = 1;
+    }
+
+    drawSkeleton(frameData, width, height) {
+        const kp = frameData.keypoints;
+
+        this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+        this.ctx.lineWidth = 1;
+
+        const connections = [
+            ['nose', 'leftShoulder'], ['nose', 'rightShoulder'],
+            ['leftShoulder', 'leftElbow'], ['rightShoulder', 'rightElbow'],
+            ['leftElbow', 'leftWrist'], ['rightElbow', 'rightWrist'],
+            ['leftShoulder', 'leftHip'], ['rightShoulder', 'rightHip'],
+            ['leftHip', 'leftKnee'], ['rightHip', 'rightKnee'],
+            ['leftKnee', 'leftAnkle'], ['rightKnee', 'rightAnkle'],
+            ['leftHip', 'rightHip'], ['leftShoulder', 'rightShoulder']
+        ];
+
+        for (const [a, b] of connections) {
+            if (kp[a] && kp[b] && kp[a].score > 0.3 && kp[b].score > 0.3) {
+                this.ctx.beginPath();
+                this.ctx.moveTo(kp[a].x * width, kp[a].y * height);
+                this.ctx.lineTo(kp[b].x * width, kp[b].y * height);
+                this.ctx.stroke();
+            }
+        }
+
+        for (const [name, point] of Object.entries(kp)) {
+            if (point.score > 0.3) {
+                this.ctx.fillStyle = this.jointColors[name] || '#ffffff';
+                this.ctx.beginPath();
+                this.ctx.arc(point.x * width, point.y * height, 3, 0, Math.PI * 2);
+                this.ctx.fill();
+            }
+        }
+    }
+
+    exportSVG() {
+        const { width, height } = this.canvas;
+        let svg = `<?xml version="1.0" encoding="UTF-8"?>
+`;
+        svg += `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+`;
+        svg += `<rect width="100%" height="100%" fill="#0a0a0a"/>
+`;
+
+        for (const [jointName, trail] of Object.entries(this.trails)) {
+            if (trail.length < 2) continue;
+
+            const points = trail.map(p => `${p.x * width},${p.y * height}`).join(' ');
+            const color = this.jointColors[jointName] || '#ffffff';
+
+            svg += `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="1" opacity="0.6"/>
+`;
+        }
+
+        svg += `</svg>`;
+        return svg;
+    }
+
+    clear() {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    }
+}
+
+// ============================================
+// 3D 渲染器 - Renderer3D
+// ============================================
+class Renderer3D {
+    constructor() {
+        this.container = document.getElementById('canvas3D');
+        this.scene = null;
+        this.camera = null;
+        this.renderer = null;
+        this.controls = null;
+        this.trailMeshes = {};
+        this.particleSystem = null;
+        this.params = {
+            tubeRadius: 0.05,
+            timeDepth: 0.05,
+            materialType: 'emissive',
+            lightIntensity: 1.0,
+            autoRotate: true,
+            bloomEffect: true
+        };
+        this.trails = {};
+        this.isInitialized = false;
+    }
+
+    init(width, height) {
+        if (this.isInitialized) return;
+
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(0x0a0a0a);
+        this.scene.fog = new THREE.FogExp2(0x0a0a0a, 0.02);
+
+        this.camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+        this.camera.position.set(5, 3, 8);
+
+        this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        this.renderer.setSize(width, height);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.container.appendChild(this.renderer.domElement);
+
+        this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping = true;
+        this.controls.dampingFactor = 0.05;
+
+        this.setupLights();
+        this.isInitialized = true;
+        this.animate();
+    }
+
+    setupLights() {
+        const ambient = new THREE.AmbientLight(0x404040, 0.5);
+        this.scene.add(ambient);
+
+        const pointLight = new THREE.PointLight(0xffffff, this.params.lightIntensity, 100);
+        pointLight.position.set(5, 10, 5);
+        this.scene.add(pointLight);
+
+        const pointLight2 = new THREE.PointLight(0x00d4ff, 0.5, 50);
+        pointLight2.position.set(-5, 5, -5);
+        this.scene.add(pointLight2);
+    }
+
+    resize(width, height) {
+        if (!this.isInitialized) return;
+        this.camera.aspect = width / height;
+        this.camera.updateProjectionMatrix();
+        this.renderer.setSize(width, height);
+    }
+
+    updateParams(newParams) {
+        Object.assign(this.params, newParams);
+
+        if (this.scene) {
+            this.scene.traverse(child => {
+                if (child.isPointLight) {
+                    child.intensity = this.params.lightIntensity;
+                }
+            });
+        }
+    }
+
+    setTrails(trails) {
+        this.trails = trails;
+        this.buildGeometry();
+    }
+
+    buildGeometry() {
+        for (const mesh of Object.values(this.trailMeshes)) {
+            this.scene.remove(mesh);
+            if (mesh.geometry) mesh.geometry.dispose();
+            if (mesh.material) mesh.material.dispose();
+        }
+        this.trailMeshes = {};
+
+        const jointColors = {
+            nose: 0xffffff,
+            leftShoulder: 0xff0066, rightShoulder: 0xff0066,
+            leftElbow: 0xff4488, rightElbow: 0xff4488,
+            leftWrist: 0xff88aa, rightWrist: 0xff88aa,
+            leftHip: 0x6600ff, rightHip: 0x6600ff,
+            leftKnee: 0x8844ff, rightKnee: 0x8844ff,
+            leftAnkle: 0xaa88ff, rightAnkle: 0xaa88ff
+        };
+
+        for (const [jointName, trail] of Object.entries(this.trails)) {
+            if (trail.length < 3) continue;
+
+            const points = trail.map((p, i) => {
+                return new THREE.Vector3(
+                    (p.x - 0.5) * 10,
+                    -(p.y - 0.5) * 10,
+                    i * this.params.timeDepth
+                );
+            });
+
+            const curve = new THREE.CatmullRomCurve3(points);
+            curve.tension = 0.5;
+
+            const geometry = new THREE.TubeGeometry(
+                curve,
+                Math.min(trail.length * 2, 200),
+                this.params.tubeRadius,
+                8,
+                false
+            );
+
+            const material = this.createMaterial(jointColors[jointName] || 0xffffff);
+
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.name = jointName;
+            this.scene.add(mesh);
+            this.trailMeshes[jointName] = mesh;
+        }
+
+        this.buildParticles();
+    }
+
+    createMaterial(color) {
+        const { materialType } = this.params;
+
+        switch(materialType) {
+            case 'emissive':
+                return new THREE.MeshStandardMaterial({
+                    color: color,
+                    emissive: color,
+                    emissiveIntensity: 0.8,
+                    transparent: true,
+                    opacity: 0.9,
+                    roughness: 0.2,
+                    metalness: 0.8
+                });
+            case 'standard':
+                return new THREE.MeshStandardMaterial({
+                    color: color,
+                    roughness: 0.5,
+                    metalness: 0.5
+                });
+            case 'wireframe':
+                return new THREE.MeshBasicMaterial({
+                    color: color,
+                    wireframe: true,
+                    transparent: true,
+                    opacity: 0.6
+                });
+            case 'glass':
+                return new THREE.MeshPhysicalMaterial({
+                    color: color,
+                    transparent: true,
+                    opacity: 0.3,
+                    roughness: 0,
+                    metalness: 0.1,
+                    transmission: 0.9,
+                    thickness: 0.5
+                });
+            default:
+                return new THREE.MeshStandardMaterial({ color: color });
+        }
+    }
+
+    buildParticles() {
+        if (this.particleSystem) {
+            this.scene.remove(this.particleSystem);
+        }
+
+        const particleCount = 2000;
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(particleCount * 3);
+        const colors = new Float32Array(particleCount * 3);
+
+        let idx = 0;
+        for (const trail of Object.values(this.trails)) {
+            for (let i = 0; i < trail.length && idx < particleCount; i += Math.ceil(trail.length / 100)) {
+                const p = trail[i];
+                positions[idx * 3] = (p.x - 0.5) * 10;
+                positions[idx * 3 + 1] = -(p.y - 0.5) * 10;
+                positions[idx * 3 + 2] = i * this.params.timeDepth;
+
+                colors[idx * 3] = 0;
+                colors[idx * 3 + 1] = 0.8;
+                colors[idx * 3 + 2] = 1;
+                idx++;
+            }
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        const material = new THREE.PointsMaterial({
+            size: 0.05,
+            vertexColors: true,
+            transparent: true,
+            opacity: 0.6,
+            blending: THREE.AdditiveBlending
+        });
+
+        this.particleSystem = new THREE.Points(geometry, material);
+        this.scene.add(this.particleSystem);
+    }
+
+    updateFrame(frameIndex) {
+    }
+
+    animate() {
+        if (!this.isInitialized) return;
+
+        requestAnimationFrame(() => this.animate());
+
+        if (this.params.autoRotate) {
+            this.controls.autoRotate = true;
+            this.controls.autoRotateSpeed = 1.0;
+        } else {
+            this.controls.autoRotate = false;
+        }
+
+        this.controls.update();
+        this.renderer.render(this.scene, this.camera);
+    }
+
+    exportGLB() {
+        return new Promise((resolve) => {
+            const exportScene = new THREE.Scene();
+
+            this.scene.traverse(child => {
+                if (child.isMesh || child.isPoints) {
+                    exportScene.add(child.clone());
+                }
+            });
+
+            const exporter = new THREE.GLTFExporter();
+            exporter.parse(exportScene, (gltf) => {
+                const blob = new Blob([JSON.stringify(gltf)], { type: 'application/json' });
+                resolve(blob);
+            }, { binary: true });
+        });
+    }
+
+    clear() {
+        if (!this.isInitialized) return;
+        for (const mesh of Object.values(this.trailMeshes)) {
+            this.scene.remove(mesh);
+        }
+        this.trailMeshes = {};
+    }
+}
+
+// ============================================
+// 导出模块 - Exporter
+// ============================================
+class Exporter {
+    constructor() {
+        this.mediaRecorder = null;
+        this.recordedChunks = [];
+        this.isRecording = false;
+    }
+
+    async exportMP4(canvas, duration = 5000) {
+        const stream = canvas.captureStream(30);
+        this.mediaRecorder = new MediaRecorder(stream, {
+            mimeType: 'video/webm; codecs=vp9'
+        });
+
+        this.recordedChunks = [];
+        this.mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) this.recordedChunks.push(e.data);
+        };
+
+        return new Promise((resolve) => {
+            this.mediaRecorder.onstop = () => {
+                const blob = new Blob(this.recordedChunks, { type: 'video/webm' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `dance-motion-art-${Date.now()}.webm`;
+                a.click();
+                URL.revokeObjectURL(url);
+                resolve();
+            };
+
+            this.mediaRecorder.start();
+            setTimeout(() => this.mediaRecorder.stop(), duration);
+        });
+    }
+
+    exportSVG(svgContent) {
+        const blob = new Blob([svgContent], { type: 'image/svg+xml' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `dance-motion-art-${Date.now()}.svg`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    async exportGLB() {
+        const blob = await renderer3D.exportGLB();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `dance-motion-sculpture-${Date.now()}.glb`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    exportPNG(canvas) {
+        const link = document.createElement('a');
+        link.download = `dance-motion-art-${Date.now()}.png`;
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+    }
+}
+
+// ============================================
+// 主应用逻辑 - App
+// ============================================
+const poseDetector = new PoseDetector();
+const renderer2D = new Renderer2D();
+const renderer3D = new Renderer3D();
+const exporter = new Exporter();
+
+let videoElement = null;
+let posesData = null;
+let trailsData = null;
+let videoInfo = null;
+let currentMode = '2D';
+let isPlaying = false;
+let animationFrame = null;
+let currentFrame = 0;
+
+const els = {
+    uploadSection: document.getElementById('uploadSection'),
+    progressSection: document.getElementById('progressSection'),
+    workspace: document.getElementById('workspace'),
+    progressBar: document.getElementById('progressBar'),
+    progressText: document.getElementById('progressText'),
+    progressPercent: document.getElementById('progressPercent'),
+    canvas2D: document.getElementById('canvas2D'),
+    canvas3D: document.getElementById('canvas3D'),
+    sourceVideo: document.getElementById('sourceVideo'),
+    timeSlider: document.getElementById('timeSlider'),
+    timeDisplay: document.getElementById('timeDisplay'),
+    playBtn: document.getElementById('playBtn'),
+    fpsDisplay: document.getElementById('fpsDisplay'),
+    poseDisplay: document.getElementById('poseDisplay'),
+    frameDisplay: document.getElementById('frameDisplay'),
+    controls2D: document.getElementById('controls2D'),
+    controls3D: document.getElementById('controls3D'),
+    btn2D: document.getElementById('btn2D'),
+    btn3D: document.getElementById('btn3D')
+};
+
+async function handleUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    currentFrame = 0;
+    isPlaying = false;
+
+    els.uploadSection.classList.add('hidden');
+    els.progressSection.classList.remove('hidden');
+
+    videoElement = els.sourceVideo;
+    videoElement.src = URL.createObjectURL(file);
+
+    await new Promise(resolve => {
+        videoElement.onloadedmetadata = () => {
+            const w = videoElement.videoWidth;
+            const h = videoElement.videoHeight;
+
+            renderer2D.resize(w, h);
+            renderer3D.init(w, h);
+            renderer3D.resize(w, h);
+
+            resolve();
+        };
+    });
+
+    try {
+        const result = await poseDetector.processVideo(videoElement, updateProgress);
+        posesData = result.poses;
+        trailsData = result.trails;
+        videoInfo = result.videoInfo;
+
+        renderer2D.setTrails(trailsData);
+        renderer3D.setTrails(trailsData);
+
+        els.progressSection.classList.add('hidden');
+        els.workspace.classList.remove('hidden');
+
+        els.timeSlider.max = posesData.length - 1;
+        updateTimeDisplay();
+
+        renderFrame(0);
+
+    } catch (err) {
+        console.error('处理失败:', err);
+        alert('视频处理失败，请尝试其他视频');
+        els.progressSection.classList.add('hidden');
+        els.uploadSection.classList.remove('hidden');
+    }
+}
+
+function updateProgress(percent) {
+    els.progressBar.style.width = `${percent}%`;
+    els.progressPercent.textContent = `${percent}%`;
+}
+
+function updateProgressText(text) {
+    els.progressText.textContent = text;
+}
+
+function renderFrame(frameIndex) {
+    if (!posesData || frameIndex >= posesData.length) return;
+
+    currentFrame = frameIndex;
+    const frameData = posesData[frameIndex];
+
+    if (currentMode === '2D') {
+        renderer2D.render(frameData, posesData, frameIndex);
+    } else {
+        renderer3D.updateFrame(frameIndex);
+    }
+
+    els.timeSlider.value = frameIndex;
+    updateTimeDisplay();
+    els.frameDisplay.textContent = `帧: ${frameIndex + 1} / ${posesData.length}`;
+    els.poseDisplay.textContent = `关键点: ${Object.keys(frameData.keypoints).length}`;
+}
+
+function togglePlay() {
+    isPlaying = !isPlaying;
+
+    if (isPlaying) {
+        els.playBtn.innerHTML = '<svg class="w-5 h-5 text-black" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>';
+        playLoop();
+    } else {
+        els.playBtn.innerHTML = '<svg class="w-5 h-5 text-black" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
+        cancelAnimationFrame(animationFrame);
+    }
+}
+
+function playLoop() {
+    if (!isPlaying) return;
+
+    currentFrame++;
+    if (currentFrame >= posesData.length) {
+        currentFrame = 0;
+    }
+
+    renderFrame(currentFrame);
+    animationFrame = requestAnimationFrame(playLoop);
+}
+
+function seekTime(value) {
+    isPlaying = false;
+    els.playBtn.innerHTML = '<svg class="w-5 h-5 text-black" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
+    currentFrame = parseInt(value);
+    renderFrame(currentFrame);
+}
+
+function updateTimeDisplay() {
+    if (!videoInfo) return;
+    const current = (currentFrame / videoInfo.fps).toFixed(1);
+    const total = videoInfo.duration.toFixed(1);
+    els.timeDisplay.textContent = `${current}s / ${total}s`;
+}
+
+function setMode(mode) {
+    currentMode = mode;
+
+    if (mode === '2D') {
+        els.canvas2D.style.display = 'block';
+        els.canvas3D.style.display = 'none';
+        els.controls2D.classList.remove('hidden');
+        els.controls3D.classList.add('hidden');
+        els.btn2D.classList.replace('bg-gray-700', 'bg-cyan-600');
+        els.btn3D.classList.replace('bg-cyan-600', 'bg-gray-700');
+        renderFrame(currentFrame);
+    } else {
+        els.canvas2D.style.display = 'none';
+        els.canvas3D.style.display = 'block';
+        els.controls2D.classList.add('hidden');
+        els.controls3D.classList.remove('hidden');
+        els.btn2D.classList.replace('bg-cyan-600', 'bg-gray-700');
+        els.btn3D.classList.replace('bg-gray-700', 'bg-cyan-600');
+    }
+}
+
+function updateParam(key, value) {
+    const numValue = parseFloat(value);
+    const boolValue = value === 'true' || value === true;
+
+    if (currentMode === '2D') {
+        renderer2D.updateParams({ [key]: isNaN(numValue) ? value : numValue });
+        if (key === 'trailLength') document.getElementById('trailLengthVal').textContent = value + '帧';
+        if (key === 'lineWidthMode') document.getElementById('lineWidthVal').textContent = 
+            value === 'speed' ? '速度映射' : value === 'fixed' ? '固定粗细' : '时间渐变';
+        if (key === 'colorMap') document.getElementById('colorMapVal').textContent = 
+            {speed:'速度', joint:'关节类型', height:'空间高度', time:'时间流逝'}[value];
+        if (key === 'bgMode') document.getElementById('bgModeVal').textContent = 
+            {trail:'残影拖尾', black:'纯黑背景', video:'视频叠加', white:'纯白背景'}[value];
+        if (key === 'connectionMode') document.getElementById('connectionVal').textContent = 
+            {none:'仅关节轨迹', adjacent:'相邻关节连线', symmetry:'对称关节连线', voronoi:'Voronoi图案'}[value];
+    } else {
+        renderer3D.updateParams({ [key]: isNaN(numValue) ? (value === 'true' || value === false ? boolValue : value) : numValue });
+        if (key === 'tubeRadius') document.getElementById('tubeRadiusVal').textContent = value;
+        if (key === 'timeDepth') document.getElementById('timeDepthVal').textContent = value;
+        if (key === 'materialType') document.getElementById('materialVal').textContent = 
+            {emissive:'发光', standard:'标准', wireframe:'线框', glass:'玻璃'}[value];
+        if (key === 'lightIntensity') document.getElementById('lightIntensityVal').textContent = value;
+    }
+
+    renderFrame(currentFrame);
+}
+
+function exportMP4() {
+    const canvas = currentMode === '2D' ? els.canvas2D : renderer3D.renderer.domElement;
+    exporter.exportMP4(canvas, 5000);
+}
+
+function exportSVG() {
+    const svg = renderer2D.exportSVG();
+    exporter.exportSVG(svg);
+}
+
+function exportGLB() {
+    exporter.exportGLB();
+}
+
+function exportPNG() {
+    const canvas = currentMode === '2D' ? els.canvas2D : renderer3D.renderer.domElement;
+    exporter.exportPNG(canvas);
+}
+
+window.addEventListener('resize', () => {
+    const container = document.querySelector('.canvas-container');
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    renderer2D.resize(w, h);
+    renderer3D.resize(w, h);
+});
+</script>
+</body>
+</html>
