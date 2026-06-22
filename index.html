@@ -6,6 +6,13 @@
     <title>莫奈花园舞者合成器（单文件版）</title>
 
     <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+    <script>
+      window.__poseCdnFailed = false;
+    </script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/pose.js"
+      onerror="window.__poseCdnFailed = true;"
+    ></script>
 
     <style>
       :root {
@@ -264,6 +271,43 @@
         padding: 0 2px;
       }
 
+      .extract-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        width: fit-content;
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(201, 169, 110, 0.32);
+        background: rgba(12, 12, 18, 0.28);
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .extract-status::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #d8b16d;
+        box-shadow: 0 0 0 3px rgba(216, 177, 109, 0.16);
+      }
+
+      .extract-status.ready {
+        color: #dff4df;
+        border-color: rgba(95, 168, 108, 0.55);
+      }
+
+      .extract-status.ready::before {
+        background: #61b36f;
+        box-shadow: 0 0 0 3px rgba(97, 179, 111, 0.16);
+      }
+
+      .extract-status.fallback {
+        color: #f0dfb0;
+        border-color: rgba(201, 169, 110, 0.58);
+      }
+
       .hidden {
         display: none !important;
       }
@@ -297,6 +341,7 @@
           <p class="dz-title">拖拽或点击上传舞蹈视频</p>
           <p class="dz-sub">支持 mp4 / webm。建议：单人、光线稳定、背景尽量干净（运动差分会更准确）。</p>
         </div>
+        <div class="extract-status" id="extractStatus">正在检测 AI 抠像能力…</div>
         <div class="hint">
           说明：右侧合成画面由「Three.js 花园底层」+「运动差分提取的舞者上层」实时叠加完成；暂停/停止时画面静止；拖动进度条跳转时花朵不回滚。
         </div>
@@ -330,7 +375,7 @@
             <canvas id="outputCanvas"></canvas>
           </div>
           <div class="hint" id="algoHint">
-            抠像：先用像素差分得到运动区域，再在其周围扩展做颜色聚类（显著性检测），并结合“前 10 帧平均”背景参考帧做前景判定；遮罩经膨胀 3px→腐蚀 2px→5px 模糊与边缘羽化后叠加到 Three.js 花园之上。
+            抠像：优先使用 MediaPipe Pose 的 33 个人体关键点生成舞者剪影遮罩，并以脚踝中点与关键点速度驱动生花；若 AI 模型加载失败，则自动回退到基础像素差分抠像。
           </div>
         </div>
       </div>
@@ -338,15 +383,19 @@
 
     <!--
       下面这些 Canvas 全部是“离屏/隐藏”的处理管线：
-      - downscaleCanvas：将视频帧缩到 320×180（用于运动检测）
-      - maskCanvas：聚合运动差分 + 背景建模 + 显著性检测后的二值遮罩
-      - maskBlurCanvas：形态学处理后再做模糊与羽化的最终遮罩
+      - downscaleCanvas：将视频帧缩到 320×180（基础回退抠像使用）
+      - maskCanvas：基础回退抠像的中间遮罩
+      - maskBlurCanvas：基础回退抠像的柔化遮罩
+      - poseCanvas：送入 MediaPipe Pose 的检测帧
+      - poseMaskCanvas：基于 33 个关键点绘制的人体剪影遮罩
       - dancerCanvas：将原始视频帧按遮罩抠出舞者（移除背景）
       - threeCanvas：Three.js 渲染输出（底层花园）
     -->
     <canvas id="downscaleCanvas" class="hidden"></canvas>
     <canvas id="maskCanvas" class="hidden"></canvas>
     <canvas id="maskBlurCanvas" class="hidden"></canvas>
+    <canvas id="poseCanvas" class="hidden"></canvas>
+    <canvas id="poseMaskCanvas" class="hidden"></canvas>
     <canvas id="dancerCanvas" class="hidden"></canvas>
     <canvas id="threeCanvas" class="hidden"></canvas>
 
@@ -358,6 +407,7 @@
           statusPill: $("#statusPill"),
           uploadCard: $("#uploadCard"),
           dropzone: $("#dropzone"),
+          extractStatus: $("#extractStatus"),
           fileInput: $("#fileInput"),
           mainCard: $("#mainCard"),
 
@@ -370,6 +420,8 @@
           downscaleCanvas: $("#downscaleCanvas"),
           maskCanvas: $("#maskCanvas"),
           maskBlurCanvas: $("#maskBlurCanvas"),
+          poseCanvas: $("#poseCanvas"),
+          poseMaskCanvas: $("#poseMaskCanvas"),
           dancerCanvas: $("#dancerCanvas"),
           threeCanvas: $("#threeCanvas"),
 
@@ -399,6 +451,11 @@
         const SPAWN_COOLDOWN_S = 1.5;
 
         const MAX_RENDER_W = 960;
+        const POSE_CANVAS_W = 640;
+        const POSE_DETECT_EVERY = 2;
+        const POSE_MAX_FPS = 15;
+        const POSE_MIN_VIS = 0.5;
+        const ANKLE_SPEED_THRESHOLD = 0.014;
 
         const state = {
           objectUrl: null,
@@ -409,6 +466,7 @@
           seekNonce: 0,
           rafId: null,
           loading: false,
+          extractionMode: "initializing",
 
           prevSample: null,
           sampleCounter: 0,
@@ -422,6 +480,18 @@
           salMask: null,
           maskImage: null,
           kMeansMeans: null,
+
+          pose: null,
+          poseInitAttempted: false,
+          poseReady: false,
+          poseFrameCounter: 0,
+          poseLastDetectAt: -999,
+          poseDetecting: false,
+          poseLastLandmarks: null,
+          poseLastWorldLandmarks: null,
+          poseLastError: null,
+          prevPoseLandmarks: null,
+          poseInfo: null,
 
           gardenTime: 0,
           lastTickMs: 0,
@@ -453,6 +523,13 @@
 
           els.dancerCanvas.width = renderW;
           els.dancerCanvas.height = renderH;
+
+          const poseW = Math.min(POSE_CANVAS_W, renderW);
+          const poseH = Math.max(2, Math.round((renderH / renderW) * poseW));
+          els.poseCanvas.width = poseW;
+          els.poseCanvas.height = poseH;
+          els.poseMaskCanvas.width = renderW;
+          els.poseMaskCanvas.height = renderH;
 
           els.downscaleCanvas.width = MOTION_W;
           els.downscaleCanvas.height = MOTION_H;
@@ -487,6 +564,35 @@
           state.prevSample = null;
           state.sampleCounter = 0;
           state.lastCentroid = null;
+          state.lastRoi = null;
+          state.bgRef = null;
+          state.prevPoseLandmarks = null;
+          state.poseLastLandmarks = null;
+          state.poseLastWorldLandmarks = null;
+          state.poseLastError = null;
+          state.poseInfo = null;
+          state.poseFrameCounter = 0;
+          state.poseLastDetectAt = -999;
+          state.poseDetecting = false;
+        }
+
+        function setExtractionStatus(mode, detail) {
+          state.extractionMode = mode;
+          els.extractStatus.className = "extract-status";
+
+          if (mode === "ai") {
+            els.extractStatus.classList.add("ready");
+            els.extractStatus.textContent = detail || "AI抠像就绪";
+            return;
+          }
+
+          if (mode === "fallback") {
+            els.extractStatus.classList.add("fallback");
+            els.extractStatus.textContent = detail || "使用基础抠像";
+            return;
+          }
+
+          els.extractStatus.textContent = detail || "正在检测 AI 抠像能力…";
         }
 
         function resetFlowers() {
@@ -552,13 +658,12 @@
           els.uploadCard.classList.add("hidden");
           els.mainCard.classList.remove("hidden");
 
-          setStatus("建立背景参考帧…");
-          await buildBackgroundReference();
-          captureDownscaleAsPrevSample();
+          setStatus("初始化舞者提取模块…");
+          await prepareExtractionPipeline();
 
           els.seek.value = "0";
           updateTimeUI();
-          renderOnce();
+          await renderOnce(true);
 
           setStatus("已就绪：可播放 / 可拖动进度条");
           state.loading = false;
@@ -630,23 +735,27 @@
           const myNonce = (state.seekNonce += 1);
           const target = Number(els.seek.value);
 
-          const fpsGuess = 30;
-          const back = (2 / fpsGuess) * 1.0;
-          const t0 = Math.max(0, target - back);
-
           setStatus("跳转中：花朵保持，更新舞者…");
-
-          await seekToTime(t0);
-          if (myNonce !== state.seekNonce) return;
-          captureDownscaleAsPrevSample();
-
-          state.sampleCounter = MOTION_SAMPLE_EVERY;
 
           await seekToTime(target);
           if (myNonce !== state.seekNonce) return;
 
+          if (state.poseReady) {
+            await detectPoseFrame(true);
+          } else {
+            const fpsGuess = 30;
+            const back = (2 / fpsGuess) * 1.0;
+            const t0 = Math.max(0, target - back);
+            await seekToTime(t0);
+            if (myNonce !== state.seekNonce) return;
+            captureDownscaleAsPrevSample();
+            state.sampleCounter = MOTION_SAMPLE_EVERY;
+            await seekToTime(target);
+            if (myNonce !== state.seekNonce) return;
+          }
+
           state.seeking = false;
-          renderOnce();
+          await renderOnce(true);
           setStatus("已暂停：画面静止");
         }
 
@@ -655,6 +764,62 @@
           dsCtx.clearRect(0, 0, MOTION_W, MOTION_H);
           dsCtx.drawImage(els.video, 0, 0, MOTION_W, MOTION_H);
           state.prevSample = dsCtx.getImageData(0, 0, MOTION_W, MOTION_H);
+        }
+
+        async function prepareExtractionPipeline() {
+          const ok = await initPoseDetector();
+          if (ok) {
+            setExtractionStatus("ai", "AI抠像就绪");
+            await detectPoseFrame(true);
+            return;
+          }
+
+          console.warn("MediaPipe Pose 不可用，回退到基础像素抠像。", state.poseLastError || "");
+          setExtractionStatus("fallback", "使用基础抠像");
+          setStatus("建立基础抠像参考帧…");
+          await buildBackgroundReference();
+          captureDownscaleAsPrevSample();
+        }
+
+        async function initPoseDetector() {
+          if (state.poseReady && state.pose) return true;
+          if (state.poseInitAttempted && !state.poseReady) return false;
+
+          state.poseInitAttempted = true;
+          setExtractionStatus("initializing", "正在初始化 AI 抠像…");
+
+          try {
+            if (window.__poseCdnFailed || typeof window.Pose === "undefined") {
+              throw new Error("MediaPipe Pose CDN 加载失败");
+            }
+
+            const pose = new window.Pose({
+              locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${file}`
+            });
+
+            pose.setOptions({
+              modelComplexity: 1,
+              smoothLandmarks: true,
+              minDetectionConfidence: 0.5,
+              minTrackingConfidence: 0.5
+            });
+
+            pose.onResults((results) => {
+              state.poseLastLandmarks = results && results.poseLandmarks ? results.poseLandmarks : null;
+              state.poseLastWorldLandmarks = results && results.poseWorldLandmarks ? results.poseWorldLandmarks : null;
+            });
+
+            state.pose = pose;
+            state.poseReady = true;
+            state.poseLastError = null;
+            return true;
+          } catch (err) {
+            state.pose = null;
+            state.poseReady = false;
+            state.poseLastError = err;
+            console.error("MediaPipe Pose 初始化失败，回退到基础抠像。", err);
+            return false;
+          }
         }
 
         function ensureMaskBuffers() {
@@ -710,8 +875,11 @@
           if (Number.isFinite(original)) await seekToTime(original);
         }
 
-        function renderOnce() {
+        async function renderOnce(forcePose) {
           if (!state.three) return;
+          if (state.poseReady && forcePose) {
+            await detectPoseFrame(true);
+          }
           state.three.render(state.gardenTime);
           updateMaskAndComposite();
           updateTimeUI();
@@ -728,6 +896,10 @@
           state.three.update(dt, state.gardenTime);
           state.three.render(state.gardenTime);
 
+          if (state.poseReady) {
+            schedulePoseDetection();
+          }
+
           const dancerInfo = updateMaskAndComposite();
           if (!state.seeking) maybeSpawnFlower(dancerInfo);
 
@@ -736,7 +908,317 @@
           state.rafId = requestAnimationFrame(tick);
         }
 
+        function shouldRunPoseThisFrame(force) {
+          if (!state.poseReady || !state.pose || state.poseDetecting) return false;
+          if (force) return true;
+
+          state.poseFrameCounter += 1;
+          if (state.poseFrameCounter % POSE_DETECT_EVERY !== 0) return false;
+
+          const t = els.video.currentTime || 0;
+          if (t - state.poseLastDetectAt < 1 / POSE_MAX_FPS) return false;
+          return true;
+        }
+
+        async function detectPoseFrame(force) {
+          if (!shouldRunPoseThisFrame(force)) return state.poseInfo;
+
+          state.poseDetecting = true;
+          try {
+            const poseCtx = els.poseCanvas.getContext("2d");
+            poseCtx.clearRect(0, 0, els.poseCanvas.width, els.poseCanvas.height);
+            poseCtx.drawImage(els.video, 0, 0, els.poseCanvas.width, els.poseCanvas.height);
+            await state.pose.send({ image: els.poseCanvas });
+            state.poseLastDetectAt = els.video.currentTime || 0;
+            state.poseInfo = computePoseInfo(state.poseLastLandmarks, state.prevPoseLandmarks);
+            if (state.poseLastLandmarks) {
+              state.prevPoseLandmarks = state.poseLastLandmarks.map((lm) => ({
+                x: lm.x,
+                y: lm.y,
+                z: lm.z,
+                visibility: lm.visibility
+              }));
+            }
+          } catch (err) {
+            state.poseLastError = err;
+            console.error("MediaPipe Pose 检测失败，切换到基础抠像。", err);
+            state.poseReady = false;
+            state.pose = null;
+            setExtractionStatus("fallback", "使用基础抠像");
+          } finally {
+            state.poseDetecting = false;
+          }
+
+          return state.poseInfo;
+        }
+
+        function schedulePoseDetection() {
+          if (!shouldRunPoseThisFrame(false)) return;
+          void detectPoseFrame(false);
+        }
+
+        function landmarkVisible(lm) {
+          if (!lm) return false;
+          return lm.visibility == null ? true : lm.visibility >= POSE_MIN_VIS;
+        }
+
+        function getLandmarkPoint(landmarks, index, w, h) {
+          const lm = landmarks && landmarks[index];
+          if (!landmarkVisible(lm)) return null;
+          return { x: lm.x * w, y: lm.y * h, z: lm.z || 0 };
+        }
+
+        function dist(a, b) {
+          if (!a || !b) return 0;
+          return Math.hypot(a.x - b.x, a.y - b.y);
+        }
+
+        function norm(vx, vy) {
+          const d = Math.hypot(vx, vy) || 1;
+          return { x: vx / d, y: vy / d };
+        }
+
+        function offsetPoint(p, dir, amount) {
+          return { x: p.x + dir.x * amount, y: p.y + dir.y * amount };
+        }
+
+        function computePoseInfo(curr, prev) {
+          if (!curr || curr.length < 33) return null;
+
+          let minX = 1;
+          let minY = 1;
+          let maxX = 0;
+          let maxY = 0;
+          let visibleCount = 0;
+          let totalDisp = 0;
+          let dispCount = 0;
+
+          for (let i = 0; i < curr.length; i++) {
+            const lm = curr[i];
+            if (!landmarkVisible(lm)) continue;
+            minX = Math.min(minX, lm.x);
+            minY = Math.min(minY, lm.y);
+            maxX = Math.max(maxX, lm.x);
+            maxY = Math.max(maxY, lm.y);
+            visibleCount += 1;
+
+            const plm = prev && prev[i];
+            if (plm && landmarkVisible(plm)) {
+              totalDisp += Math.hypot(lm.x - plm.x, lm.y - plm.y);
+              dispCount += 1;
+            }
+          }
+
+          if (!visibleCount) return null;
+
+          const padX = (maxX - minX) * 0.15;
+          const padY = (maxY - minY) * 0.15;
+          const bbox = {
+            x0: clamp(minX - padX, 0, 1),
+            y0: clamp(minY - padY, 0, 1),
+            x1: clamp(maxX + padX, 0, 1),
+            y1: clamp(maxY + padY, 0, 1)
+          };
+
+          const leftAnkle = curr[27];
+          const rightAnkle = curr[28];
+          let ankleMid = null;
+          if (landmarkVisible(leftAnkle) && landmarkVisible(rightAnkle)) {
+            ankleMid = { x: (leftAnkle.x + rightAnkle.x) * 0.5, y: (leftAnkle.y + rightAnkle.y) * 0.5 };
+          } else if (landmarkVisible(leftAnkle)) {
+            ankleMid = { x: leftAnkle.x, y: leftAnkle.y };
+          } else if (landmarkVisible(rightAnkle)) {
+            ankleMid = { x: rightAnkle.x, y: rightAnkle.y };
+          }
+
+          let ankleSpeed = 0;
+          if (ankleMid && prev && prev[27] && prev[28] && landmarkVisible(prev[27]) && landmarkVisible(prev[28])) {
+            const prevMid = { x: (prev[27].x + prev[28].x) * 0.5, y: (prev[27].y + prev[28].y) * 0.5 };
+            ankleSpeed = Math.hypot(ankleMid.x - prevMid.x, ankleMid.y - prevMid.y);
+          }
+
+          return {
+            landmarks: curr,
+            bbox,
+            ankleMid,
+            ankleSpeed,
+            intensity: clamp((dispCount ? totalDisp / dispCount : 0) * 22, 0, 1)
+          };
+        }
+
+        function drawHeadSilhouette(ctx, landmarks, w, h, lineWidth) {
+          const pts = [0, 2, 5, 7, 8, 9, 10].map((idx) => getLandmarkPoint(landmarks, idx, w, h)).filter(Boolean);
+          if (!pts.length) return;
+
+          let minX = Infinity;
+          let minY = Infinity;
+          let maxX = -Infinity;
+          let maxY = -Infinity;
+          for (const p of pts) {
+            minX = Math.min(minX, p.x);
+            minY = Math.min(minY, p.y);
+            maxX = Math.max(maxX, p.x);
+            maxY = Math.max(maxY, p.y);
+          }
+          ctx.beginPath();
+          ctx.ellipse(
+            (minX + maxX) * 0.5,
+            (minY + maxY) * 0.5,
+            Math.max((maxX - minX) * 0.7, lineWidth * 0.65),
+            Math.max((maxY - minY) * 1.0, lineWidth * 0.85),
+            0,
+            0,
+            Math.PI * 2
+          );
+          ctx.fill();
+        }
+
+        function drawTorsoSilhouette(ctx, landmarks, w, h, lineWidth) {
+          const sL = getLandmarkPoint(landmarks, 11, w, h);
+          const sR = getLandmarkPoint(landmarks, 12, w, h);
+          const hL = getLandmarkPoint(landmarks, 23, w, h);
+          const hR = getLandmarkPoint(landmarks, 24, w, h);
+          if (!(sL && sR && hL && hR)) return;
+
+          const shoulderDir = norm(sR.x - sL.x, sR.y - sL.y);
+          const hipDir = norm(hR.x - hL.x, hR.y - hL.y);
+
+          const p1 = offsetPoint(sL, { x: -shoulderDir.x, y: -shoulderDir.y }, lineWidth * 0.42);
+          const p2 = offsetPoint(sR, shoulderDir, lineWidth * 0.42);
+          const p3 = offsetPoint(hR, hipDir, lineWidth * 0.5);
+          const p4 = offsetPoint(hL, { x: -hipDir.x, y: -hipDir.y }, lineWidth * 0.5);
+
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.lineTo(p3.x, p3.y);
+          ctx.lineTo(p4.x, p4.y);
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        function drawLimbSilhouette(ctx, landmarks, chain, w, h, width) {
+          const pts = chain.map((idx) => getLandmarkPoint(landmarks, idx, w, h)).filter(Boolean);
+          if (pts.length < 2) return;
+          ctx.save();
+          ctx.lineWidth = width;
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+          ctx.stroke();
+          for (const p of pts) {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, width * 0.48, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.restore();
+        }
+
+        function drawPoseMask(poseInfo) {
+          const ctx = els.poseMaskCanvas.getContext("2d");
+          const w = els.poseMaskCanvas.width;
+          const h = els.poseMaskCanvas.height;
+          ctx.clearRect(0, 0, w, h);
+
+          if (!poseInfo || !poseInfo.landmarks) return false;
+
+          const landmarks = poseInfo.landmarks;
+          const shoulderL = getLandmarkPoint(landmarks, 11, w, h);
+          const shoulderR = getLandmarkPoint(landmarks, 12, w, h);
+          const hipL = getLandmarkPoint(landmarks, 23, w, h);
+          const hipR = getLandmarkPoint(landmarks, 24, w, h);
+          const bodyRef =
+            (dist(shoulderL, hipL) + dist(shoulderR, hipR) + dist(shoulderL, shoulderR) + dist(hipL, hipR)) / 4;
+          const lineWidth = clamp(bodyRef * 0.3 || 22, 14, 60);
+
+          ctx.save();
+          ctx.fillStyle = "#ffffff";
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+
+          const bx = poseInfo.bbox.x0 * w;
+          const by = poseInfo.bbox.y0 * h;
+          const bw = (poseInfo.bbox.x1 - poseInfo.bbox.x0) * w;
+          const bh = (poseInfo.bbox.y1 - poseInfo.bbox.y0) * h;
+          ctx.beginPath();
+          ctx.rect(bx, by, bw, bh);
+          ctx.clip();
+
+          drawHeadSilhouette(ctx, landmarks, w, h, lineWidth);
+          drawTorsoSilhouette(ctx, landmarks, w, h, lineWidth);
+          drawLimbSilhouette(ctx, landmarks, [11, 13, 15, 17, 19, 21], w, h, lineWidth * 0.95);
+          drawLimbSilhouette(ctx, landmarks, [12, 14, 16, 18, 20, 22], w, h, lineWidth * 0.95);
+          drawLimbSilhouette(ctx, landmarks, [23, 25, 27, 31], w, h, lineWidth * 1.08);
+          drawLimbSilhouette(ctx, landmarks, [24, 26, 28, 32], w, h, lineWidth * 1.08);
+
+          const joints = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
+          for (const idx of joints) {
+            const p = getLandmarkPoint(landmarks, idx, w, h);
+            if (!p) continue;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, lineWidth * 0.58, 0, Math.PI * 2);
+            ctx.fill();
+          }
+
+          ctx.restore();
+          ctx.save();
+          ctx.filter = "blur(8px)";
+          ctx.drawImage(els.poseMaskCanvas, 0, 0);
+          ctx.restore();
+          return true;
+        }
+
         function updateMaskAndComposite() {
+          if (state.poseReady || state.poseLastLandmarks) return updateMaskAndCompositePose();
+          return updateMaskAndCompositeFallback();
+        }
+
+        function updateMaskAndCompositePose() {
+          const outCtx = els.outputCanvas.getContext("2d");
+          const dancerCtx = els.dancerCanvas.getContext("2d");
+          const renderW = state.renderW;
+          const renderH = state.renderH;
+
+          if (!renderW || !renderH || !els.video.videoWidth) {
+            outCtx.clearRect(0, 0, els.outputCanvas.width, els.outputCanvas.height);
+            return { hasCentroid: false };
+          }
+
+          const ok = drawPoseMask(state.poseInfo);
+
+          dancerCtx.save();
+          dancerCtx.clearRect(0, 0, renderW, renderH);
+          dancerCtx.drawImage(els.video, 0, 0, renderW, renderH);
+          if (ok) {
+            dancerCtx.globalCompositeOperation = "destination-in";
+            dancerCtx.drawImage(els.poseMaskCanvas, 0, 0, renderW, renderH);
+          } else {
+            dancerCtx.clearRect(0, 0, renderW, renderH);
+          }
+          dancerCtx.restore();
+
+          outCtx.save();
+          outCtx.clearRect(0, 0, renderW, renderH);
+          outCtx.drawImage(els.threeCanvas, 0, 0, renderW, renderH);
+          outCtx.drawImage(els.dancerCanvas, 0, 0, renderW, renderH);
+          outCtx.restore();
+
+          if (!state.poseInfo || !state.poseInfo.ankleMid) return { hasCentroid: false };
+
+          return {
+            hasCentroid: true,
+            footNorm: {
+              x: clamp(state.poseInfo.ankleMid.x, 0, 1),
+              y: clamp(state.poseInfo.ankleMid.y, 0, 1)
+            },
+            ankleSpeed: state.poseInfo.ankleSpeed || 0,
+            intensity: state.poseInfo.intensity || 0,
+            bbox: state.poseInfo.bbox
+          };
+        }
+
+        function updateMaskAndCompositeFallback() {
           const outCtx = els.outputCanvas.getContext("2d");
           const dancerCtx = els.dancerCanvas.getContext("2d");
           const dsCtx = els.downscaleCanvas.getContext("2d", { willReadFrequently: true });
@@ -759,13 +1241,11 @@
 
           state.sampleCounter += 1;
           const shouldComputeDiff = state.sampleCounter % MOTION_SAMPLE_EVERY === 0;
-
           const a = curr.data;
           const n = MOTION_W * MOTION_H;
 
           if (shouldComputeDiff && state.prevSample) {
             const b = state.prevSample.data;
-
             let sumX = 0;
             let sumY = 0;
             let count = 0;
@@ -798,12 +1278,10 @@
               const cx = sumX / count;
               const cy = sumY / count;
               state.lastCentroid = { x: cx, y: cy, count };
-
               const w = Math.max(1, maxX - minX + 1);
               const h = Math.max(1, maxY - minY + 1);
               const ex = Math.floor(w * 0.3);
               const ey = Math.floor(h * 0.3);
-
               state.lastRoi = {
                 x0: clamp(minX - ex, 0, MOTION_W - 1),
                 y0: clamp(minY - ey, 0, MOTION_H - 1),
@@ -857,9 +1335,7 @@
 
           {
             const d = state.maskImage.data;
-            for (let p = 0; p < n; p++) {
-              d[p * 4 + 3] = state.maskA[p] ? 255 : 0;
-            }
+            for (let p = 0; p < n; p++) d[p * 4 + 3] = state.maskA[p] ? 255 : 0;
             maskCtx.putImageData(state.maskImage, 0, 0);
           }
 
@@ -868,13 +1344,11 @@
           blurCtx.filter = `blur(${MASK_BLUR_PX}px)`;
           blurCtx.drawImage(els.maskCanvas, 0, 0);
           blurCtx.restore();
-
           featherMaskCanvas(blurCtx);
 
           dancerCtx.save();
           dancerCtx.clearRect(0, 0, renderW, renderH);
           dancerCtx.drawImage(els.video, 0, 0, renderW, renderH);
-
           dancerCtx.globalCompositeOperation = "destination-in";
           dancerCtx.imageSmoothingEnabled = true;
           dancerCtx.drawImage(els.maskBlurCanvas, 0, 0, renderW, renderH);
@@ -887,17 +1361,15 @@
           outCtx.restore();
 
           if (!state.lastCentroid) return { hasCentroid: false };
-
           const cxN = state.lastCentroid.x / MOTION_W;
           const cyN = state.lastCentroid.y / MOTION_H;
-
           const footYN = clamp(cyN + 0.18 + (Math.sin(state.gardenTime * 1.7) * 0.03 + 0.03), 0, 1);
 
           return {
             hasCentroid: true,
-            centroidNorm: { x: cxN, y: cyN },
             footNorm: { x: cxN, y: footYN },
-            motionCount: state.lastCentroid.count || 0
+            ankleSpeed: 0.02,
+            intensity: 0.35
           };
         }
 
