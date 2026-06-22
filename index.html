@@ -330,7 +330,7 @@
             <canvas id="outputCanvas"></canvas>
           </div>
           <div class="hint" id="algoHint">
-            抠像：将每帧缩小到 320×180，隔 2 帧做像素差分（亮度变化&gt;25），生成 alpha 遮罩；遮罩轻微模糊（2px）柔化边缘；再将舞者叠加到 Three.js 花园之上。
+            抠像：先用像素差分得到运动区域，再在其周围扩展做颜色聚类（显著性检测），并结合“前 10 帧平均”背景参考帧做前景判定；遮罩经膨胀 3px→腐蚀 2px→5px 模糊与边缘羽化后叠加到 Three.js 花园之上。
           </div>
         </div>
       </div>
@@ -339,8 +339,8 @@
     <!--
       下面这些 Canvas 全部是“离屏/隐藏”的处理管线：
       - downscaleCanvas：将视频帧缩到 320×180（用于运动检测）
-      - maskCanvas：差分阈值后的 alpha 遮罩
-      - maskBlurCanvas：对遮罩做 2px 模糊，边缘更柔和
+      - maskCanvas：聚合运动差分 + 背景建模 + 显著性检测后的二值遮罩
+      - maskBlurCanvas：形态学处理后再做模糊与羽化的最终遮罩
       - dancerCanvas：将原始视频帧按遮罩抠出舞者（移除背景）
       - threeCanvas：Three.js 渲染输出（底层花园）
     -->
@@ -382,7 +382,18 @@
         const MOTION_H = 180;
         const MOTION_THRESHOLD = 25;
         const MOTION_SAMPLE_EVERY = 2;
-        const MASK_BLUR_PX = 2;
+        const MASK_BLUR_PX = 5;
+
+        const BG_BUILD_FRAMES = 10;
+        const BG_DIFF_THRESHOLD = 22;
+        const SALIENCY_K = 3;
+        const SALIENCY_ITERS = 5;
+        const SALIENCY_COLOR_DIST = 36;
+
+        const MORPH_DILATE_PX = 3;
+        const MORPH_ERODE_PX = 2;
+        const FEATHER_IN = 18;
+        const FEATHER_OUT = 210;
 
         const SPAWN_INTERVAL_S = 0.5;
         const SPAWN_COOLDOWN_S = 1.5;
@@ -397,10 +408,20 @@
           seeking: false,
           seekNonce: 0,
           rafId: null,
+          loading: false,
 
           prevSample: null,
           sampleCounter: 0,
           lastCentroid: null,
+          lastRoi: null,
+          bgRef: null,
+          motionMask: null,
+          maskA: null,
+          maskB: null,
+          bgMask: null,
+          salMask: null,
+          maskImage: null,
+          kMeansMeans: null,
 
           gardenTime: 0,
           lastTickMs: 0,
@@ -500,6 +521,7 @@
             return;
           }
 
+          state.loading = true;
           stopLoop();
 
           if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
@@ -530,11 +552,16 @@
           els.uploadCard.classList.add("hidden");
           els.mainCard.classList.remove("hidden");
 
+          setStatus("建立背景参考帧…");
+          await buildBackgroundReference();
+          captureDownscaleAsPrevSample();
+
           els.seek.value = "0";
           updateTimeUI();
           renderOnce();
 
           setStatus("已就绪：可播放 / 可拖动进度条");
+          state.loading = false;
         }
 
         function updateTimeUI() {
@@ -568,7 +595,7 @@
           stopLoop();
           els.playBtn.textContent = "播放";
           renderOnce();
-          setStatus("已暂停：画面静止");
+          if (!state.loading) setStatus("已暂停：画面静止");
         }
 
         function handleVideoEnded() {
@@ -630,6 +657,59 @@
           state.prevSample = dsCtx.getImageData(0, 0, MOTION_W, MOTION_H);
         }
 
+        function ensureMaskBuffers() {
+          const n = MOTION_W * MOTION_H;
+          if (!state.motionMask) state.motionMask = new Uint8Array(n);
+          if (!state.maskA) state.maskA = new Uint8Array(n);
+          if (!state.maskB) state.maskB = new Uint8Array(n);
+          if (!state.bgMask) state.bgMask = new Uint8Array(n);
+          if (!state.salMask) state.salMask = new Uint8Array(n);
+          if (!state.kMeansMeans) state.kMeansMeans = new Float32Array(SALIENCY_K * 3);
+        }
+
+        async function buildBackgroundReference() {
+          ensureMaskBuffers();
+
+          const dsCtx = els.downscaleCanvas.getContext("2d", { willReadFrequently: true });
+          const d = els.video.duration || 0;
+          const fpsGuess = 30;
+          const dt = 1 / fpsGuess;
+
+          const original = els.video.currentTime || 0;
+          els.video.pause();
+
+          const n = MOTION_W * MOTION_H;
+          const acc = new Float32Array(n * 3);
+
+          const frames = Math.max(1, BG_BUILD_FRAMES);
+          for (let i = 0; i < frames; i++) {
+            const t = Math.min(d || 0, i * dt);
+            if (Number.isFinite(t)) await seekToTime(t);
+            dsCtx.clearRect(0, 0, MOTION_W, MOTION_H);
+            dsCtx.drawImage(els.video, 0, 0, MOTION_W, MOTION_H);
+            const img = dsCtx.getImageData(0, 0, MOTION_W, MOTION_H);
+            const data = img.data;
+            for (let p = 0; p < n; p++) {
+              const j = p * 4;
+              const k = p * 3;
+              acc[k] += data[j];
+              acc[k + 1] += data[j + 1];
+              acc[k + 2] += data[j + 2];
+            }
+          }
+
+          const bg = new Uint8Array(n * 3);
+          for (let p = 0; p < n; p++) {
+            const k = p * 3;
+            bg[k] = Math.round(acc[k] / frames);
+            bg[k + 1] = Math.round(acc[k + 1] / frames);
+            bg[k + 2] = Math.round(acc[k + 2] / frames);
+          }
+          state.bgRef = bg;
+
+          if (Number.isFinite(original)) await seekToTime(original);
+        }
+
         function renderOnce() {
           if (!state.three) return;
           state.three.render(state.gardenTime);
@@ -675,61 +755,121 @@
           dsCtx.drawImage(els.video, 0, 0, MOTION_W, MOTION_H);
           const curr = dsCtx.getImageData(0, 0, MOTION_W, MOTION_H);
 
-          let centroid = null;
+          ensureMaskBuffers();
 
           state.sampleCounter += 1;
           const shouldComputeDiff = state.sampleCounter % MOTION_SAMPLE_EVERY === 0;
 
-          if (shouldComputeDiff && state.prevSample) {
-            const a = curr.data;
-            const b = state.prevSample.data;
+          const a = curr.data;
+          const n = MOTION_W * MOTION_H;
 
-            const mask = maskCtx.createImageData(MOTION_W, MOTION_H);
-            const m = mask.data;
+          if (shouldComputeDiff && state.prevSample) {
+            const b = state.prevSample.data;
 
             let sumX = 0;
             let sumY = 0;
             let count = 0;
+            let minX = MOTION_W;
+            let minY = MOTION_H;
+            let maxX = 0;
+            let maxY = 0;
 
-            for (let i = 0; i < a.length; i += 4) {
+            for (let p = 0; p < n; p++) {
+              const i = p * 4;
               const y1 = 0.299 * a[i] + 0.587 * a[i + 1] + 0.114 * a[i + 2];
               const y0 = 0.299 * b[i] + 0.587 * b[i + 1] + 0.114 * b[i + 2];
               const diff = Math.abs(y1 - y0);
-
-              const alpha = diff > MOTION_THRESHOLD ? 255 : 0;
-              m[i] = 255;
-              m[i + 1] = 255;
-              m[i + 2] = 255;
-              m[i + 3] = alpha;
-
-              if (alpha) {
-                const px = (i / 4) % MOTION_W;
-                const py = Math.floor(i / 4 / MOTION_W);
+              const on = diff > MOTION_THRESHOLD ? 255 : 0;
+              state.motionMask[p] = on;
+              if (on) {
+                const px = p % MOTION_W;
+                const py = (p / MOTION_W) | 0;
                 sumX += px;
                 sumY += py;
                 count += 1;
+                if (px < minX) minX = px;
+                if (py < minY) minY = py;
+                if (px > maxX) maxX = px;
+                if (py > maxY) maxY = py;
               }
             }
 
-            maskCtx.putImageData(mask, 0, 0);
+            if (count > 140) {
+              const cx = sumX / count;
+              const cy = sumY / count;
+              state.lastCentroid = { x: cx, y: cy, count };
 
-            if (count > 120) {
-              centroid = { x: sumX / count, y: sumY / count, count };
-              state.lastCentroid = centroid;
-            } else {
-              centroid = state.lastCentroid;
+              const w = Math.max(1, maxX - minX + 1);
+              const h = Math.max(1, maxY - minY + 1);
+              const ex = Math.floor(w * 0.3);
+              const ey = Math.floor(h * 0.3);
+
+              state.lastRoi = {
+                x0: clamp(minX - ex, 0, MOTION_W - 1),
+                y0: clamp(minY - ey, 0, MOTION_H - 1),
+                x1: clamp(maxX + ex, 0, MOTION_W - 1),
+                y1: clamp(maxY + ey, 0, MOTION_H - 1)
+              };
             }
-
-            blurCtx.save();
-            blurCtx.clearRect(0, 0, MOTION_W, MOTION_H);
-            blurCtx.filter = `blur(${MASK_BLUR_PX}px)`;
-            blurCtx.drawImage(els.maskCanvas, 0, 0);
-            blurCtx.restore();
 
             state.prevSample = curr;
           } else if (shouldComputeDiff && !state.prevSample) {
             state.prevSample = curr;
           }
+
+          const bg = state.bgRef;
+          state.bgMask.fill(0);
+          if (bg) {
+            for (let p = 0; p < n; p++) {
+              const i = p * 4;
+              const k = p * 3;
+              const dr = Math.abs(a[i] - bg[k]);
+              const dg = Math.abs(a[i + 1] - bg[k + 1]);
+              const db = Math.abs(a[i + 2] - bg[k + 2]);
+              const diff = (dr + dg + db) / 3;
+              state.bgMask[p] = diff > BG_DIFF_THRESHOLD ? 255 : 0;
+            }
+          }
+
+          state.salMask.fill(0);
+          if (bg && state.lastRoi) {
+            computeSaliencyMask(a, bg, state.lastRoi, state.kMeansMeans, state.salMask);
+          }
+
+          for (let p = 0; p < n; p++) {
+            state.maskA[p] = state.bgMask[p] | state.salMask[p] | state.motionMask[p];
+          }
+
+          dilateMask(state.maskA, state.maskB, MOTION_W, MOTION_H, MORPH_DILATE_PX);
+          erodeMask(state.maskB, state.maskA, MOTION_W, MOTION_H, MORPH_ERODE_PX);
+
+          if (!state.maskImage) {
+            state.maskImage = maskCtx.createImageData(MOTION_W, MOTION_H);
+            const d = state.maskImage.data;
+            for (let p = 0; p < n; p++) {
+              const i = p * 4;
+              d[i] = 255;
+              d[i + 1] = 255;
+              d[i + 2] = 255;
+              d[i + 3] = 0;
+            }
+          }
+
+          {
+            const d = state.maskImage.data;
+            for (let p = 0; p < n; p++) {
+              d[p * 4 + 3] = state.maskA[p] ? 255 : 0;
+            }
+            maskCtx.putImageData(state.maskImage, 0, 0);
+          }
+
+          blurCtx.save();
+          blurCtx.clearRect(0, 0, MOTION_W, MOTION_H);
+          blurCtx.filter = `blur(${MASK_BLUR_PX}px)`;
+          blurCtx.drawImage(els.maskCanvas, 0, 0);
+          blurCtx.restore();
+
+          featherMaskCanvas(blurCtx);
 
           dancerCtx.save();
           dancerCtx.clearRect(0, 0, renderW, renderH);
@@ -746,14 +886,10 @@
           outCtx.drawImage(els.dancerCanvas, 0, 0, renderW, renderH);
           outCtx.restore();
 
-          if (!centroid) {
-            centroid = state.lastCentroid;
-          }
+          if (!state.lastCentroid) return { hasCentroid: false };
 
-          if (!centroid) return { hasCentroid: false };
-
-          const cxN = centroid.x / MOTION_W;
-          const cyN = centroid.y / MOTION_H;
+          const cxN = state.lastCentroid.x / MOTION_W;
+          const cyN = state.lastCentroid.y / MOTION_H;
 
           const footYN = clamp(cyN + 0.18 + (Math.sin(state.gardenTime * 1.7) * 0.03 + 0.03), 0, 1);
 
@@ -761,8 +897,218 @@
             hasCentroid: true,
             centroidNorm: { x: cxN, y: cyN },
             footNorm: { x: cxN, y: footYN },
-            motionCount: centroid.count || 0
+            motionCount: state.lastCentroid.count || 0
           };
+        }
+
+        function smoothstep(edge0, edge1, x) {
+          const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+          return t * t * (3 - 2 * t);
+        }
+
+        function featherMaskCanvas(ctx) {
+          const img = ctx.getImageData(0, 0, MOTION_W, MOTION_H);
+          const d = img.data;
+          for (let p = 0; p < MOTION_W * MOTION_H; p++) {
+            const i = p * 4 + 3;
+            const a = d[i];
+            const s = smoothstep(FEATHER_IN, FEATHER_OUT, a);
+            d[i] = Math.round(s * 255);
+          }
+          ctx.putImageData(img, 0, 0);
+        }
+
+        function dilateMask(src, dst, w, h, r) {
+          if (r <= 0) {
+            dst.set(src);
+            return;
+          }
+          dst.fill(0);
+          for (let y = 0; y < h; y++) {
+            const y0 = Math.max(0, y - r);
+            const y1 = Math.min(h - 1, y + r);
+            for (let x = 0; x < w; x++) {
+              const x0 = Math.max(0, x - r);
+              const x1 = Math.min(w - 1, x + r);
+              let on = 0;
+              for (let yy = y0; yy <= y1 && !on; yy++) {
+                let idx = yy * w + x0;
+                for (let xx = x0; xx <= x1; xx++, idx++) {
+                  if (src[idx]) {
+                    on = 255;
+                    break;
+                  }
+                }
+              }
+              dst[y * w + x] = on;
+            }
+          }
+        }
+
+        function erodeMask(src, dst, w, h, r) {
+          if (r <= 0) {
+            dst.set(src);
+            return;
+          }
+          dst.fill(0);
+          for (let y = 0; y < h; y++) {
+            const y0 = Math.max(0, y - r);
+            const y1 = Math.min(h - 1, y + r);
+            for (let x = 0; x < w; x++) {
+              const x0 = Math.max(0, x - r);
+              const x1 = Math.min(w - 1, x + r);
+              let on = 255;
+              for (let yy = y0; yy <= y1 && on; yy++) {
+                let idx = yy * w + x0;
+                for (let xx = x0; xx <= x1; xx++, idx++) {
+                  if (!src[idx]) {
+                    on = 0;
+                    break;
+                  }
+                }
+              }
+              dst[y * w + x] = on;
+            }
+          }
+        }
+
+        function computeSaliencyMask(currRGBA, bgRGB, roi, means, outMask) {
+          const x0 = roi.x0 | 0;
+          const y0 = roi.y0 | 0;
+          const x1 = roi.x1 | 0;
+          const y1 = roi.y1 | 0;
+
+          const roiW = Math.max(1, x1 - x0 + 1);
+          const roiH = Math.max(1, y1 - y0 + 1);
+
+          const sampleMax = 1400;
+          const samples = [];
+
+          const step = roiW * roiH > 20000 ? 2 : 1;
+          for (let y = y0; y <= y1; y += step) {
+            for (let x = x0; x <= x1; x += step) {
+              const p = y * MOTION_W + x;
+              const i = p * 4;
+              samples.push([currRGBA[i], currRGBA[i + 1], currRGBA[i + 2]]);
+              if (samples.length >= sampleMax) break;
+            }
+            if (samples.length >= sampleMax) break;
+          }
+          if (samples.length < 12) return;
+
+          const bgMean = [0, 0, 0];
+          {
+            let c = 0;
+            const step2 = step * 2;
+            for (let y = y0; y <= y1; y += step2) {
+              for (let x = x0; x <= x1; x += step2) {
+                const p = y * MOTION_W + x;
+                const k = p * 3;
+                bgMean[0] += bgRGB[k];
+                bgMean[1] += bgRGB[k + 1];
+                bgMean[2] += bgRGB[k + 2];
+                c++;
+              }
+            }
+            bgMean[0] /= c;
+            bgMean[1] /= c;
+            bgMean[2] /= c;
+          }
+
+          for (let k = 0; k < SALIENCY_K; k++) {
+            const s = samples[(Math.random() * samples.length) | 0];
+            means[k * 3] = s[0];
+            means[k * 3 + 1] = s[1];
+            means[k * 3 + 2] = s[2];
+          }
+
+          const assigns = new Uint8Array(samples.length);
+          for (let it = 0; it < SALIENCY_ITERS; it++) {
+            const sum = new Float32Array(SALIENCY_K * 4);
+
+            for (let i = 0; i < samples.length; i++) {
+              const r = samples[i][0];
+              const g = samples[i][1];
+              const b = samples[i][2];
+
+              let bestK = 0;
+              let bestD = Infinity;
+              for (let k = 0; k < SALIENCY_K; k++) {
+                const mr = means[k * 3];
+                const mg = means[k * 3 + 1];
+                const mb = means[k * 3 + 2];
+                const d = (r - mr) * (r - mr) + (g - mg) * (g - mg) + (b - mb) * (b - mb);
+                if (d < bestD) {
+                  bestD = d;
+                  bestK = k;
+                }
+              }
+              assigns[i] = bestK;
+              const off = bestK * 4;
+              sum[off] += r;
+              sum[off + 1] += g;
+              sum[off + 2] += b;
+              sum[off + 3] += 1;
+            }
+
+            for (let k = 0; k < SALIENCY_K; k++) {
+              const off = k * 4;
+              const c = sum[off + 3] || 1;
+              means[k * 3] = sum[off] / c;
+              means[k * 3 + 1] = sum[off + 1] / c;
+              means[k * 3 + 2] = sum[off + 2] / c;
+            }
+          }
+
+          let bgK = 0;
+          let bestBg = Infinity;
+          for (let k = 0; k < SALIENCY_K; k++) {
+            const dr = means[k * 3] - bgMean[0];
+            const dg = means[k * 3 + 1] - bgMean[1];
+            const db = means[k * 3 + 2] - bgMean[2];
+            const d = dr * dr + dg * dg + db * db;
+            if (d < bestBg) {
+              bestBg = d;
+              bgK = k;
+            }
+          }
+
+          const bgMr = means[bgK * 3];
+          const bgMg = means[bgK * 3 + 1];
+          const bgMb = means[bgK * 3 + 2];
+
+          for (let y = y0; y <= y1; y += step) {
+            for (let x = x0; x <= x1; x += step) {
+              const p = y * MOTION_W + x;
+              const i = p * 4;
+              const r = currRGBA[i];
+              const g = currRGBA[i + 1];
+              const b = currRGBA[i + 2];
+
+              let bestK2 = 0;
+              let bestD2 = Infinity;
+              for (let k = 0; k < SALIENCY_K; k++) {
+                const mr = means[k * 3];
+                const mg = means[k * 3 + 1];
+                const mb = means[k * 3 + 2];
+                const d = (r - mr) * (r - mr) + (g - mg) * (g - mg) + (b - mb) * (b - mb);
+                if (d < bestD2) {
+                  bestD2 = d;
+                  bestK2 = k;
+                }
+              }
+
+              if (bestK2 !== bgK) {
+                const dr = means[bestK2 * 3] - bgMr;
+                const dg = means[bestK2 * 3 + 1] - bgMg;
+                const db = means[bestK2 * 3 + 2] - bgMb;
+                const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+                if (dist > SALIENCY_COLOR_DIST) {
+                  outMask[p] = 255;
+                }
+              }
+            }
+          }
         }
 
         function maybeSpawnFlower(dancerInfo) {
